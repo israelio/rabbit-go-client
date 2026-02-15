@@ -18,7 +18,7 @@ A production-ready Go client library for RabbitMQ that provides API parity with 
 ## Installation
 
 ```bash
-go get github.com/israelio/rabbit-go-client
+go get github.com/israelio/rabbit-go-client v1.0.0
 ```
 
 ## Quick Start
