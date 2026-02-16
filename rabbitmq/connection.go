@@ -82,6 +82,16 @@ type Connection struct {
 	// Recovery
 	recovery *recoveryManager
 
+	// Recovery notification channels
+	recoveryStartedChans   []chan struct{}
+	recoveryCompletedChans []chan struct{}
+	recoveryFailedChans    []chan error
+	notificationMux        sync.RWMutex
+
+	// Recovery control
+	recoveryStop chan struct{}
+	recoveryDone chan struct{}
+
 	// Listeners
 	listenerMux sync.RWMutex
 	listeners   []ConnectionListener
@@ -307,7 +317,11 @@ func (c *Connection) handleConnectionOpenOk(f *frame.Frame) error {
 
 // start starts background goroutines
 func (c *Connection) start() {
-	c.closed = make(chan struct{})
+	// Only create control channels if they don't exist (initial connection)
+	// During recovery, reuse existing channels so monitors don't get orphaned
+	if c.closed == nil {
+		c.closed = make(chan struct{})
+	}
 	c.dispatchStop = make(chan struct{})
 	c.dispatchDone = make(chan struct{})
 	c.heartbeatStop = make(chan struct{})
@@ -323,6 +337,14 @@ func (c *Connection) start() {
 	if c.heartbeat > 0 {
 		go c.heartbeatSender()
 		go c.heartbeatMonitor()
+	}
+
+	// Start recovery monitor if automatic recovery is enabled
+	// But skip if already running (during recovery, we don't start a new monitor)
+	if c.factory.AutomaticRecovery && c.recoveryStop == nil {
+		c.recoveryStop = make(chan struct{})
+		c.recoveryDone = make(chan struct{})
+		go c.recoveryMonitor()
 	}
 
 	// Notify listeners
@@ -547,6 +569,266 @@ func (c *Connection) updateActivity() {
 	c.lastActivity.Store(time.Now().Unix())
 }
 
+// recoveryMonitor monitors for connection failures and initiates recovery
+func (c *Connection) recoveryMonitor() {
+	defer close(c.recoveryDone)
+
+	for {
+		select {
+		case err := <-c.closeChan:
+			// Check if should recover
+			if !c.factory.AutomaticRecovery || err == nil || !err.Recover {
+				return
+			}
+
+			// Initiate recovery
+			c.initiateRecovery(err)
+			// Continue monitoring for subsequent disconnects (don't exit)
+
+		case <-c.recoveryStop:
+			return
+		case <-c.closed:
+			return
+		}
+	}
+}
+
+// initiateRecovery attempts to recover the connection after a failure
+func (c *Connection) initiateRecovery(originalErr *Error) {
+	// 1. Set state to StateRecovering
+	c.state.Store(int32(StateRecovering))
+
+	// 2. Notify recovery started
+	c.notifyRecoveryStarted()
+	c.notifyListeners(func(l ConnectionListener) {
+		l.OnConnectionRecoveryStarted(c)
+	})
+	if c.factory.RecoveryHandler != nil {
+		c.factory.RecoveryHandler.OnRecoveryStarted(c)
+	}
+
+	// 3. Capture channel state before cleanup
+	channelSnapshots := c.captureChannelState()
+
+	// 4. Retry loop
+	maxAttempts := c.factory.ConnectionRetryAttempts
+	if maxAttempts <= 0 {
+		maxAttempts = 3 // Default
+	}
+
+	for attempt := 0; attempt < maxAttempts; attempt++ {
+		if attempt > 0 {
+			backoff := c.calculateBackoff(attempt)
+			time.Sleep(backoff)
+		}
+
+		// 5. Reconnect
+		netConn, err := c.factory.dial(context.Background())
+		if err != nil {
+			c.notifyRecoveryFailed(err)
+			if c.factory.RecoveryHandler != nil {
+				c.factory.RecoveryHandler.OnRecoveryFailed(c, err)
+			}
+			continue
+		}
+
+		// 6. Replace network connection
+		c.conn = netConn
+
+		// 7. Perform handshake
+		if err := c.handshake(context.Background()); err != nil {
+			netConn.Close()
+			c.notifyRecoveryFailed(err)
+			if c.factory.RecoveryHandler != nil {
+				c.factory.RecoveryHandler.OnRecoveryFailed(c, err)
+			}
+			continue
+		}
+
+		// 8. Clear old channels before starting new connection
+		c.channelMux.Lock()
+		c.channels = make(map[uint16]*Channel)
+		c.nextChannelID = 1
+		c.channelMux.Unlock()
+
+		// 8a. Reset closeOnce so future disconnects can be detected
+		// Note: We keep the existing closeChan - the recovery monitor is listening on it
+		c.closeOnce = sync.Once{}
+
+		// 8b. Restart background goroutines (recovery monitor keeps running, so won't start duplicate)
+		c.start()
+
+		// 8c. Set state to StateOpen so we can create channels for recovery
+		// The connection is now fully functional after handshake
+		c.state.Store(int32(StateOpen))
+
+		// 9. Recover topology
+		if c.factory.TopologyRecovery {
+			if c.factory.RecoveryHandler != nil {
+				c.factory.RecoveryHandler.OnTopologyRecoveryStarted(c)
+			}
+			if err := c.recovery.recoverTopology(c); err != nil {
+				c.Close()
+				c.notifyRecoveryFailed(err)
+				if c.factory.RecoveryHandler != nil {
+					c.factory.RecoveryHandler.OnRecoveryFailed(c, err)
+				}
+				continue
+			}
+			if c.factory.RecoveryHandler != nil {
+				c.factory.RecoveryHandler.OnTopologyRecoveryCompleted(c)
+			}
+		}
+
+		// 10. Recover channels
+		if err := c.recoverChannels(channelSnapshots); err != nil {
+			c.Close()
+			c.notifyRecoveryFailed(err)
+			if c.factory.RecoveryHandler != nil {
+				c.factory.RecoveryHandler.OnRecoveryFailed(c, err)
+			}
+			continue
+		}
+
+		// 11. Success! State is already StateOpen from step 8b
+		c.notifyRecoveryCompleted()
+		c.notifyListeners(func(l ConnectionListener) {
+			l.OnConnectionRecoveryCompleted(c)
+		})
+		if c.factory.RecoveryHandler != nil {
+			c.factory.RecoveryHandler.OnRecoveryCompleted(c)
+		}
+		return
+	}
+
+	// All attempts exhausted
+	c.state.Store(int32(StateClosed))
+	finalErr := fmt.Errorf("recovery exhausted after %d attempts", maxAttempts)
+	c.notifyRecoveryFailed(finalErr)
+	if c.factory.RecoveryHandler != nil {
+		c.factory.RecoveryHandler.OnRecoveryFailed(c, finalErr)
+	}
+}
+
+// calculateBackoff calculates the backoff duration for a recovery attempt
+func (c *Connection) calculateBackoff(attempt int) time.Duration {
+	baseInterval := c.factory.RecoveryInterval
+	if baseInterval <= 0 {
+		baseInterval = 5 * time.Second
+	}
+
+	// Exponential backoff: base * 2^attempt, capped at 32x base
+	multiplier := 1 << uint(attempt)
+	if multiplier > 32 {
+		multiplier = 32
+	}
+
+	return baseInterval * time.Duration(multiplier)
+}
+
+// captureChannelState captures the current state of all channels for recovery
+func (c *Connection) captureChannelState() []channelSnapshot {
+	c.channelMux.RLock()
+	defer c.channelMux.RUnlock()
+
+	snapshots := make([]channelSnapshot, 0, len(c.channels))
+	for id, ch := range c.channels {
+		snap := channelSnapshot{
+			ch:            ch, // Store reference to the actual channel object
+			id:            id,
+			prefetchCount: ch.prefetchCount,
+			prefetchSize:  ch.prefetchSize,
+			globalQos:     ch.globalQos,
+			confirmMode:   ch.confirms != nil,
+		}
+
+		// Capture consumers
+		ch.consumerMux.RLock()
+		for _, consumer := range ch.consumers {
+			if consumer.callback != nil { // Only callback-based consumers
+				snap.consumers = append(snap.consumers, consumerSnapshot{
+					queue:    consumer.queue,
+					tag:      consumer.tag,
+					callback: consumer.callback,
+					opts: ConsumeOptions{
+						AutoAck:   consumer.autoAck,
+						Exclusive: consumer.exclusive,
+						NoLocal:   consumer.noLocal,
+						Args:      consumer.args,
+					},
+				})
+			}
+		}
+		ch.consumerMux.RUnlock()
+
+		snapshots = append(snapshots, snap)
+	}
+	return snapshots
+}
+
+// recoverChannels restores channels from snapshots after recovery
+func (c *Connection) recoverChannels(snapshots []channelSnapshot) error {
+	maxChannelID := uint16(0)
+
+	for _, snap := range snapshots {
+		// Reuse the existing channel object (so application references remain valid)
+		ch := snap.ch
+
+		// Reset channel internal state for new connection
+		ch.conn = c
+		ch.incomingFrames = make(chan *frame.Frame, 100)
+		ch.closeChan = make(chan *Error, 1)
+		ch.closed = make(chan struct{})
+		ch.consumers = make(map[string]*consumerState)
+		ch.rpcWaiters = make(map[uint32]chan *frame.Method)
+		ch.closeOnce = sync.Once{} // Reset close guard
+		ch.state.Store(int32(StateConnecting))
+
+		// Re-register channel in the connection's channel map
+		c.channelMux.Lock()
+		c.channels[snap.id] = ch
+		if snap.id > maxChannelID {
+			maxChannelID = snap.id
+		}
+		c.channelMux.Unlock()
+
+		// Open channel
+		if err := ch.open(context.Background()); err != nil {
+			return fmt.Errorf("recover channel %d: %w", snap.id, err)
+		}
+
+		// Restore QoS
+		if snap.prefetchCount > 0 || snap.prefetchSize > 0 {
+			if err := ch.Qos(snap.prefetchCount, snap.prefetchSize, snap.globalQos); err != nil {
+				return fmt.Errorf("recover channel %d QoS: %w", snap.id, err)
+			}
+		}
+
+		// Enable confirms if needed
+		if snap.confirmMode {
+			if err := ch.ConfirmSelect(false); err != nil {
+				return fmt.Errorf("recover channel %d confirms: %w", snap.id, err)
+			}
+		}
+
+		// Recover consumers
+		for _, consumer := range snap.consumers {
+			if err := ch.ConsumeWithCallback(consumer.queue, consumer.tag, consumer.opts, consumer.callback); err != nil {
+				return fmt.Errorf("recover consumer %s: %w", consumer.tag, err)
+			}
+			// Notify consumer of recovery
+			consumer.callback.HandleRecoverOk(consumer.tag)
+		}
+	}
+
+	// Update nextChannelID to be after all recovered channels
+	c.channelMux.Lock()
+	c.nextChannelID = maxChannelID + 1
+	c.channelMux.Unlock()
+
+	return nil
+}
+
 // NewChannel creates a new channel on this connection
 func (c *Connection) NewChannel() (*Channel, error) {
 	return c.NewChannelWithContext(context.Background())
@@ -554,7 +836,11 @@ func (c *Connection) NewChannel() (*Channel, error) {
 
 // NewChannelWithContext creates a new channel with context support
 func (c *Connection) NewChannelWithContext(ctx context.Context) (*Channel, error) {
-	if c.GetState() != StateOpen {
+	state := c.GetState()
+	if state == StateRecovering {
+		return nil, ErrRecovering
+	}
+	if state != StateOpen {
 		return nil, ErrClosed
 	}
 
@@ -612,21 +898,66 @@ func (c *Connection) GetChannelCount() int {
 }
 
 // NotifyRecoveryStarted registers for recovery started notifications
-// Note: This is a placeholder. Automatic recovery is not yet fully implemented.
-func (c *Connection) NotifyRecoveryStarted(ch chan struct{}) {
-	// TODO: Implement when automatic recovery is added
+func (c *Connection) NotifyRecoveryStarted(ch chan struct{}) chan struct{} {
+	c.notificationMux.Lock()
+	defer c.notificationMux.Unlock()
+	c.recoveryStartedChans = append(c.recoveryStartedChans, ch)
+	return ch
 }
 
 // NotifyRecoveryCompleted registers for recovery completed notifications
-// Note: This is a placeholder. Automatic recovery is not yet fully implemented.
-func (c *Connection) NotifyRecoveryCompleted(ch chan struct{}) {
-	// TODO: Implement when automatic recovery is added
+func (c *Connection) NotifyRecoveryCompleted(ch chan struct{}) chan struct{} {
+	c.notificationMux.Lock()
+	defer c.notificationMux.Unlock()
+	c.recoveryCompletedChans = append(c.recoveryCompletedChans, ch)
+	return ch
 }
 
 // NotifyRecoveryFailed registers for recovery failed notifications
-// Note: This is a placeholder. Automatic recovery is not yet fully implemented.
-func (c *Connection) NotifyRecoveryFailed(ch chan error) {
-	// TODO: Implement when automatic recovery is added
+func (c *Connection) NotifyRecoveryFailed(ch chan error) chan error {
+	c.notificationMux.Lock()
+	defer c.notificationMux.Unlock()
+	c.recoveryFailedChans = append(c.recoveryFailedChans, ch)
+	return ch
+}
+
+// notifyRecoveryStarted sends recovery started notifications to all registered channels
+func (c *Connection) notifyRecoveryStarted() {
+	c.notificationMux.RLock()
+	defer c.notificationMux.RUnlock()
+
+	for _, ch := range c.recoveryStartedChans {
+		select {
+		case ch <- struct{}{}:
+		default:
+		}
+	}
+}
+
+// notifyRecoveryCompleted sends recovery completed notifications to all registered channels
+func (c *Connection) notifyRecoveryCompleted() {
+	c.notificationMux.RLock()
+	defer c.notificationMux.RUnlock()
+
+	for _, ch := range c.recoveryCompletedChans {
+		select {
+		case ch <- struct{}{}:
+		default:
+		}
+	}
+}
+
+// notifyRecoveryFailed sends recovery failed notifications to all registered channels
+func (c *Connection) notifyRecoveryFailed(err error) {
+	c.notificationMux.RLock()
+	defer c.notificationMux.RUnlock()
+
+	for _, ch := range c.recoveryFailedChans {
+		select {
+		case ch <- err:
+		default:
+		}
+	}
 }
 
 // CloseWithCode closes the connection with a specific reply code and text
@@ -679,8 +1010,12 @@ func (c *Connection) closeWithError(err *Error) {
 			c.factory.ErrorHandler.HandleConnectionError(c, err)
 		}
 
-		close(c.closed)
-		c.cleanup()
+		// Only close c.closed and cleanup if this is NOT a recoverable error
+		// For recoverable errors, we want to keep the recovery monitor running
+		if !err.Recover || !c.factory.AutomaticRecovery {
+			close(c.closed)
+			c.cleanup()
+		}
 	})
 }
 
@@ -703,6 +1038,19 @@ func (c *Connection) cleanup() {
 		case <-c.heartbeatDone:
 		case <-time.After(2 * time.Second):
 			// Timeout waiting for heartbeat to stop
+		}
+	}
+
+	// Stop recovery monitor if running
+	if c.factory.AutomaticRecovery {
+		func() {
+			defer func() { recover() }()
+			close(c.recoveryStop)
+		}()
+
+		select {
+		case <-c.recoveryDone:
+		case <-time.After(2 * time.Second):
 		}
 	}
 

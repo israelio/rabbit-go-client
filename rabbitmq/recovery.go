@@ -1,6 +1,7 @@
 package rabbitmq
 
 import (
+	"fmt"
 	"sync"
 	"time"
 )
@@ -44,6 +45,25 @@ type bindingDeclaration struct {
 
 // consumerDeclaration records a consumer
 type consumerDeclaration struct {
+	queue    string
+	tag      string
+	callback ConsumerCallback
+	opts     ConsumeOptions
+}
+
+// channelSnapshot captures the state of a channel for recovery
+type channelSnapshot struct {
+	ch            *Channel // Reference to the actual channel object (will be reused)
+	id            uint16
+	prefetchCount int
+	prefetchSize  int
+	globalQos     bool
+	confirmMode   bool
+	consumers     []consumerSnapshot
+}
+
+// consumerSnapshot captures the state of a consumer for recovery
+type consumerSnapshot struct {
 	queue    string
 	tag      string
 	callback ConsumerCallback
@@ -165,43 +185,47 @@ func (rm *recoveryManager) recover(factory *ConnectionFactory) (*Connection, err
 
 // recoverTopology recovers exchanges, queues, bindings, and consumers
 func (rm *recoveryManager) recoverTopology(conn *Connection) error {
+	// Copy topology lists while holding lock, then release BEFORE doing recovery operations
+	// This prevents deadlock when ExchangeDeclare/etc try to record topology
 	rm.mu.RLock()
-	defer rm.mu.RUnlock()
+	exchanges := make([]exchangeDeclaration, len(rm.exchanges))
+	queues := make([]queueDeclaration, len(rm.queues))
+	bindings := make([]bindingDeclaration, len(rm.bindings))
+	copy(exchanges, rm.exchanges)
+	copy(queues, rm.queues)
+	copy(bindings, rm.bindings)
+	rm.mu.RUnlock()
 
 	// Open a channel for recovery
 	ch, err := conn.NewChannel()
 	if err != nil {
-		return err
+		return fmt.Errorf("create recovery channel: %w", err)
 	}
 	defer ch.Close()
 
 	// Recover exchanges
-	for _, ex := range rm.exchanges {
+	for i, ex := range exchanges {
 		if err := ch.ExchangeDeclare(ex.name, ex.kind, ex.opts); err != nil {
-			return err
+			return fmt.Errorf("recover exchange %d/%d (%s): %w", i+1, len(exchanges), ex.name, err)
 		}
 	}
 
 	// Recover queues
-	for _, q := range rm.queues {
+	for i, q := range queues {
 		if _, err := ch.QueueDeclare(q.name, q.opts); err != nil {
-			return err
+			return fmt.Errorf("recover queue %d/%d (%s): %w", i+1, len(queues), q.name, err)
 		}
 	}
 
 	// Recover bindings
-	for _, b := range rm.bindings {
+	for i, b := range bindings {
 		if err := ch.QueueBind(b.queue, b.exchange, b.routingKey, b.args); err != nil {
-			return err
+			return fmt.Errorf("recover binding %d/%d (%s->%s): %w", i+1, len(bindings), b.exchange, b.queue, err)
 		}
 	}
 
-	// Recover consumers
-	for _, c := range rm.consumers {
-		if err := ch.ConsumeWithCallback(c.queue, c.tag, c.opts, c.callback); err != nil {
-			return err
-		}
-	}
+	// NOTE: Consumers are NOT recovered here! They are recovered in recoverChannels()
+	// on the application's actual channels, not on this temporary recovery channel.
 
 	return nil
 }

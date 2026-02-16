@@ -115,6 +115,11 @@ func (ch *Channel) ConsumeWithCallback(queue, consumerTag string, opts ConsumeOp
 		args := frame.NewMethodArgs(method.Args)
 		returnedTag, _ := args.ReadShortString()
 		callback.HandleConsumeOk(returnedTag)
+
+		// Record topology for recovery (skip if we're recovering to avoid duplicates)
+		if ch.conn.GetState() != StateRecovering {
+			ch.conn.recovery.recordConsumer(queue, returnedTag, callback, opts)
+		}
 	}
 
 	return nil

@@ -32,6 +32,13 @@ var (
 		Recover: false,
 	}
 
+	ErrRecovering = &Error{
+		Code:    protocol.ReplyInternalError,
+		Reason:  "connection is recovering",
+		Server:  false,
+		Recover: false,
+	}
+
 	ErrChannelClosed = &Error{
 		Code:    protocol.ReplyChannelError,
 		Reason:  "channel closed",
@@ -154,11 +161,20 @@ var (
 
 // NewError creates a new Error from reply code and text
 func NewError(code int, reason string, server bool) *Error {
+	// Recoverable errors are those that can be retried after reconnection:
+	// - Connection forced (320): Network failure, broker restart
+	// - Frame errors (501): Protocol errors that may be transient
+	// - Client-side errors (server=false): Network timeouts, connection lost
+	// Non-recoverable: Channel errors (504), application errors (4xx)
+	recover := code == protocol.ReplyConnectionForced ||
+		code == protocol.ReplyFrameError ||
+		!server // All client-side errors (network failures)
+
 	return &Error{
 		Code:    code,
 		Reason:  reason,
 		Server:  server,
-		Recover: code != protocol.ReplyConnectionForced && code < 500,
+		Recover: recover,
 	}
 }
 

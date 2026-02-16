@@ -66,6 +66,11 @@ func (ch *Channel) ExchangeDeclare(name, kind string, opts ExchangeDeclareOption
 		return fmt.Errorf("unexpected response to Exchange.Declare: %d", method.MethodID)
 	}
 
+	// Record topology for recovery (skip if we're recovering to avoid duplicates)
+	if ch.conn.GetState() != StateRecovering {
+		ch.conn.recovery.recordExchange(name, kind, opts)
+	}
+
 	return nil
 }
 
@@ -209,6 +214,11 @@ func (ch *Channel) QueueDeclare(name string, opts QueueDeclareOptions) (Queue, e
 	messageCount, _ := args.ReadUint32()
 	consumerCount, _ := args.ReadUint32()
 
+	// Record topology for recovery (skip if we're recovering to avoid duplicates)
+	if ch.conn.GetState() != StateRecovering {
+		ch.conn.recovery.recordQueue(queueName, opts)
+	}
+
 	return Queue{
 		Name:      queueName,
 		Messages:  int(messageCount),
@@ -305,6 +315,11 @@ func (ch *Channel) QueueBind(name, exchange, routingKey string, args Table) erro
 
 	if method.MethodID != protocol.MethodQueueBindOk {
 		return fmt.Errorf("unexpected response to Queue.Bind: %d", method.MethodID)
+	}
+
+	// Record topology for recovery (skip if we're recovering to avoid duplicates)
+	if ch.conn.GetState() != StateRecovering {
+		ch.conn.recovery.recordBinding(name, exchange, routingKey, args)
 	}
 
 	return nil

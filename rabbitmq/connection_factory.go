@@ -120,6 +120,7 @@ func (cf *ConnectionFactory) NewConnectionWithContext(ctx context.Context) (*Con
 		nextChannelID: 1,
 		closeChan:     make(chan *Error, 1),
 		blockedChan:   make(chan BlockedNotification, 1),
+		recovery:      newRecoveryManager(cf.AutomaticRecovery, cf.TopologyRecovery, cf.RecoveryInterval, cf.ConnectionRetryAttempts),
 	}
 	conn.state.Store(int32(StateConnecting))
 
